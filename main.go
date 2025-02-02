@@ -1,4 +1,3 @@
-// adhd.go
 package main
 
 import (
@@ -10,13 +9,15 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -27,9 +28,11 @@ import (
 // ------------------------------
 
 const (
-	QuestionInterval = 10 * time.Minute
-	MinAnswerWords   = 5
-	ActiveMaxDiff    = 5 // minutes: maximum added even if a long gap
+	QuestionInterval       = 10 * time.Minute
+	MinAnswerWords         = 5
+	IdleThreshold          = 2 * time.Minute  // a session ends if no event arrives in this interval
+	ClientRateLimitMinutes = 2                // client output only once every 2 minutes
+	PeriodicLogInterval    = 10 * time.Second // server logs status every 2 minutes
 )
 
 var (
@@ -46,10 +49,9 @@ var (
 // API response types
 
 type UpdateResponse struct {
-	RecentFileChanges int    `json:"recent_file_changes"`
-	ActiveMinutes     int    `json:"active_minutes"`
-	NextQuestionIn    string `json:"next_question_in"` // as human-readable
-	Message           string `json:"message,omitempty"`
+	ActiveMinutes  int    `json:"active_minutes"`   // total minutes accumulated today
+	NextQuestionIn string `json:"next_question_in"` // as human-readable
+	Message        string `json:"message,omitempty"`
 }
 
 type QuestionResponse struct {
@@ -68,22 +70,30 @@ type InteractionRequest struct {
 // ------------------------------
 
 type Server struct {
-	logFilePath       string
-	statsDir          string
-	logMutex          sync.Mutex
-	statsMutex        sync.Mutex
-	todayActiveMins   int
-	lastIncrementTime time.Time
-	lastQuestionTime  time.Time
-	// For file-change notifications we count changes in a short window:
-	recentChanges     int
-	recentChangesLock sync.Mutex
+	logFilePath string
+	statsDir    string
 
-	// watcher and watched directories
+	logMutex   sync.Mutex
+	statsMutex sync.Mutex
+
+	// total active time accumulated for the day (as a Duration)
+	totalActive time.Duration
+
+	// Active session (if any). When a file event comes in:
+	// - if no session is active, start one.
+	// - if one is active and the gap is <= IdleThreshold, update its end time.
+	// - otherwise, close the old session and start a new one.
+	currentSessionStart time.Time
+	currentSessionEnd   time.Time
+
+	// lastQuestionTime is kept in-memory.
+	lastQuestionTime time.Time
+
+	// watcher and watched directories.
 	watcher     *fsnotify.Watcher
 	directories []string
 
-	// used to reset daily stats
+	// current date string "YYYY-MM-DD"
 	currentDate string
 }
 
@@ -105,7 +115,6 @@ func NewServer(watchDirs []string) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Write CSV header.
 		_, err = f.WriteString("timestamp,folder,question,answer\n")
 		f.Close()
 		if err != nil {
@@ -118,17 +127,96 @@ func NewServer(watchDirs []string) (*Server, error) {
 		return nil, err
 	}
 
-	server := &Server{
-		logFilePath:       logFilePath,
-		statsDir:          adhdDir,
-		watcher:           watcher,
-		directories:       watchDirs,
-		currentDate:       time.Now().Format("2006-01-02"),
-		lastIncrementTime: time.Now(),
-		lastQuestionTime:  time.Now().Add(-QuestionInterval), // so that a question is allowed immediately
+	s := &Server{
+		logFilePath:      logFilePath,
+		statsDir:         adhdDir,
+		watcher:          watcher,
+		directories:      watchDirs,
+		currentDate:      time.Now().Format("2006-01-02"),
+		lastQuestionTime: time.Now().Add(-QuestionInterval), // allow a question immediately
+	}
+	// Load previously persisted active time for today.
+	s.loadDailyActiveTime()
+
+	return s, nil
+}
+
+// loadDailyActiveTime loads the total active time from disk.
+func (s *Server) loadDailyActiveTime() {
+	statsFile := filepath.Join(s.statsDir, s.currentDate+"_time.txt")
+	data, err := os.ReadFile(statsFile)
+	if err != nil {
+		s.totalActive = 0
+		_ = os.WriteFile(statsFile, []byte("0"), 0644)
+		return
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		s.totalActive = 0
+		return
+	}
+	// Store as a Duration in minutes.
+	s.totalActive = time.Duration(val) * time.Minute
+}
+
+// persistDailyActiveTime writes the total active time (in minutes) to disk.
+func (s *Server) persistDailyActiveTime() {
+	statsFile := filepath.Join(s.statsDir, s.currentDate+"_time.txt")
+	minutes := int(s.totalActive.Minutes())
+	_ = os.WriteFile(statsFile, []byte(fmt.Sprintf("%d", minutes)), 0644)
+}
+
+// updateActiveSession is called on each file event.
+func (s *Server) updateActiveSession(now time.Time) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+
+	// If the day has changed, flush any active session and reset.
+	currentDate := now.Format("2006-01-02")
+	if currentDate != s.currentDate {
+		s.closeActiveSession(now)
+		s.currentDate = currentDate
+		s.totalActive = 0
+		s.persistDailyActiveTime()
 	}
 
-	return server, nil
+	// If no session is active, start one.
+	if s.currentSessionStart.IsZero() {
+		s.currentSessionStart = now
+		s.currentSessionEnd = now
+		return
+	}
+
+	// If the gap between this event and the last event is within the idle threshold,
+	// update the session's end time.
+	if now.Sub(s.currentSessionEnd) <= IdleThreshold {
+		s.currentSessionEnd = now
+		return
+	}
+
+	// Otherwise, the previous session is over.
+	s.closeActiveSession(now)
+	// Start a new session.
+	s.currentSessionStart = now
+	s.currentSessionEnd = now
+}
+
+// closeActiveSession closes the current session (if any) and adds its duration to the total.
+func (s *Server) closeActiveSession(now time.Time) {
+	if s.currentSessionStart.IsZero() {
+		return
+	}
+	// Compute the session duration.
+	sessionDuration := s.currentSessionEnd.Sub(s.currentSessionStart)
+	s.totalActive += sessionDuration
+	s.persistDailyActiveTime()
+	log.Printf("Closed session: start=%s, end=%s, duration=%s; total active today: %s",
+		s.currentSessionStart.Format("15:04:05"),
+		s.currentSessionEnd.Format("15:04:05"),
+		sessionDuration, s.totalActive)
+	// Reset the active session.
+	s.currentSessionStart = time.Time{}
+	s.currentSessionEnd = time.Time{}
 }
 
 // addWatchers recursively adds watchers to directories.
@@ -146,7 +234,6 @@ func (s *Server) addWatchers() error {
 				return nil // skip error files
 			}
 			if info.IsDir() {
-				// Skip some directories (like .git, node_modules)
 				base := filepath.Base(path)
 				if base == ".git" || base == "node_modules" {
 					return filepath.SkipDir
@@ -164,7 +251,7 @@ func (s *Server) addWatchers() error {
 	return nil
 }
 
-// Start the file watcher in a goroutine.
+// startWatcher runs the fsnotify watcher in a goroutine.
 func (s *Server) startWatcher() {
 	go func() {
 		for {
@@ -173,11 +260,11 @@ func (s *Server) startWatcher() {
 				if !ok {
 					return
 				}
-				// We consider Create and Write events.
+				// For Write and Create events, update the active session.
 				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-					s.handleFileEvent(event)
+					s.updateActiveSession(time.Now())
 				}
-				// If a new directory is created, add watcher for it.
+				// If a new directory is created, add a watcher for it.
 				if event.Op&fsnotify.Create != 0 {
 					fi, err := os.Stat(event.Name)
 					if err == nil && fi.IsDir() {
@@ -192,43 +279,49 @@ func (s *Server) startWatcher() {
 			}
 		}
 	}()
+
+	// Start a background ticker to check for idle sessions.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			s.statsMutex.Lock()
+			// If there is an active session and the gap since the last event is greater than IdleThreshold,
+			// then close the session.
+			if !s.currentSessionStart.IsZero() && now.Sub(s.currentSessionEnd) > IdleThreshold {
+				s.statsMutex.Unlock()
+				s.closeActiveSession(now)
+			} else {
+				s.statsMutex.Unlock()
+			}
+		}
+	}()
 }
 
-// handleFileEvent processes a file change event.
-func (s *Server) handleFileEvent(event fsnotify.Event) {
-	slog.Info("new file event", "event", event.Name)
-	s.recentChangesLock.Lock()
-	s.recentChanges++
-	s.recentChangesLock.Unlock()
-
-	now := time.Now()
-
-	s.statsMutex.Lock()
-	// Reset daily stats if day changed.
-	today := now.Format("2006-01-02")
-	if today != s.currentDate {
-		s.currentDate = today
-		s.todayActiveMins = 0
-		s.lastIncrementTime = now
-	}
-	// Compute minutes passed since last increment.
-	diff := now.Sub(s.lastIncrementTime)
-	if diff >= time.Minute {
-		mins := int(diff.Minutes())
-		if mins > ActiveMaxDiff {
-			mins = ActiveMaxDiff
+// startPeriodicLogging logs server status periodically.
+func (s *Server) startPeriodicLogging() {
+	go func() {
+		ticker := time.NewTicker(PeriodicLogInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.statsMutex.Lock()
+			activeMins := int(s.totalActive.Minutes())
+			sessionActive := !s.currentSessionStart.IsZero()
+			var sessionInfo string
+			if sessionActive {
+				sessionDuration := time.Since(s.currentSessionStart)
+				sessionInfo = fmt.Sprintf("Active session started at %s (running for %s)", s.currentSessionStart.Format("15:04:05"), sessionDuration)
+			} else {
+				sessionInfo = "No active session"
+			}
+			s.statsMutex.Unlock()
+			log.Printf("[Periodic] Date: %s | Total active minutes today: %d | %s", s.currentDate, activeMins, sessionInfo)
 		}
-		s.todayActiveMins += mins
-		s.lastIncrementTime = now
-		log.Printf("File change detected (%s). Added %d minute(s). Total active minutes today: %d", event.Name, mins, s.todayActiveMins)
-		// Optionally, you could write the updated value to a stats file.
-	}
-	s.statsMutex.Unlock()
+	}()
 }
 
 // logInteraction writes an interaction to the CSV log.
 func (s *Server) logInteraction(timestamp time.Time, folder, question, answer string) error {
-	// Replace commas with semicolons.
 	folder = strings.ReplaceAll(folder, ",", ";")
 	question = strings.ReplaceAll(question, ",", ";")
 	answer = strings.ReplaceAll(answer, ",", ";")
@@ -243,8 +336,7 @@ func (s *Server) logInteraction(timestamp time.Time, folder, question, answer st
 	}
 	defer f.Close()
 	w := csv.NewWriter(f)
-	err = w.Write([]string{formatted, folder, question, answer})
-	if err != nil {
+	if err := w.Write([]string{formatted, folder, question, answer}); err != nil {
 		return err
 	}
 	w.Flush()
@@ -258,16 +350,14 @@ func (s *Server) logInteraction(timestamp time.Time, folder, question, answer st
 // GET /updates returns current stats.
 func (s *Server) updatesHandler(w http.ResponseWriter, r *http.Request) {
 	s.statsMutex.Lock()
-	activeMins := s.todayActiveMins
+	// Compute active minutes from the accumulated total.
+	activeMins := int(s.totalActive.Minutes())
+	// Also, if a session is active, add the current session's duration.
+	if !s.currentSessionStart.IsZero() {
+		activeMins += int(time.Since(s.currentSessionStart).Minutes())
+	}
 	s.statsMutex.Unlock()
 
-	s.recentChangesLock.Lock()
-	recent := s.recentChanges
-	// Reset recent changes counter after reporting.
-	s.recentChanges = 0
-	s.recentChangesLock.Unlock()
-
-	// Compute time remaining until next question.
 	now := time.Now()
 	elapsed := now.Sub(s.lastQuestionTime)
 	var remaining time.Duration
@@ -278,11 +368,9 @@ func (s *Server) updatesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := UpdateResponse{
-		RecentFileChanges: recent,
-		ActiveMinutes:     activeMins,
-		NextQuestionIn:    remaining.Truncate(time.Second).String(),
+		ActiveMinutes:  activeMins,
+		NextQuestionIn: remaining.Truncate(time.Second).String(),
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -295,7 +383,6 @@ func (s *Server) questionHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Too soon – next question in %s", remaining.Truncate(time.Second)), http.StatusTooEarly)
 		return
 	}
-	// Pick a random question.
 	q := questions[rand.Intn(len(questions))]
 	s.lastQuestionTime = now
 
@@ -307,25 +394,19 @@ func (s *Server) questionHandler(w http.ResponseWriter, r *http.Request) {
 // POST /interaction accepts a JSON payload with the answer.
 func (s *Server) interactionHandler(w http.ResponseWriter, r *http.Request) {
 	var req InteractionRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-
-	// Validate that answer has at least MinAnswerWords.
-	words := strings.Fields(req.Answer)
-	if len(words) < MinAnswerWords {
+	if len(strings.Fields(req.Answer)) < MinAnswerWords {
 		http.Error(w, fmt.Sprintf("Answer too short: please use at least %d words", MinAnswerWords), http.StatusBadRequest)
 		return
 	}
-
 	timestamp := time.Unix(req.Timestamp, 0)
 	if err := s.logInteraction(timestamp, req.Folder, req.Question, req.Answer); err != nil {
 		http.Error(w, "Failed to log interaction", http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, `{"status": "logged"}`)
 }
@@ -346,25 +427,92 @@ func (s *Server) runHTTP(addr string) {
 // Client mode (example)
 // ------------------------------
 
-// clientGetQuestion shows how a client might use the API.
-func clientGetQuestion(serverAddr string) error {
-	resp, err := http.Get("http://" + serverAddr + "/question")
+// Color definitions for client output.
+var (
+	colorReset = "\033[0m"
+	colorCyan  = "\033[1;36m"
+)
+
+// getClientLogStateFile returns the path of the persistent client log timestamp file.
+func getClientLogStateFile() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".adhd", "last_client_log"), nil
+}
+
+// shouldLogClientOutput returns true if at least ClientRateLimitMinutes have passed.
+func shouldLogClientOutput() bool {
+	stateFile, err := getClientLogStateFile()
+	if err != nil {
+		return true // fallback: log output
+	}
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return true
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return true
+	}
+	lastLog := time.Unix(ts, 0)
+	return time.Since(lastLog) >= ClientRateLimitMinutes*time.Minute
+}
+
+// updateClientLogTimestamp updates the persistent client log timestamp.
+func updateClientLogTimestamp() {
+	stateFile, err := getClientLogStateFile()
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(stateFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
+}
+
+// clientGetUpdates shows update information (only prints if rate limit allows).
+func clientGetUpdates(serverAddr string) error {
+	if !shouldLogClientOutput() {
+		return nil
+	}
+	resp, err := http.Get("http://" + serverAddr + "/updates")
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("error: %s", body)
-	}
-	var qResp QuestionResponse
-	err = json.NewDecoder(resp.Body).Decode(&qResp)
-	if err != nil {
+	var up UpdateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&up); err != nil {
 		return err
 	}
-	fmt.Printf("\n=== ADHD Checkpoint ===\n%s\n", qResp.Question)
+	// Print with an extra newline and color.
+	output := fmt.Sprintf("\n%s🛠️  Active minutes today: %d, next question in: %s%s\n",
+		colorCyan, up.ActiveMinutes, up.NextQuestionIn, colorReset)
+	fmt.Print(output)
+	updateClientLogTimestamp()
 	return nil
+}
+
+// clientGetQuestion fetches a question from the server.
+func clientGetQuestion(serverAddr string) (string, error) {
+	resp, err := http.Get("http://" + serverAddr + "/question")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("%s", body)
+	}
+	var qResp QuestionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&qResp); err != nil {
+		return "", err
+	}
+	// Print the question in color with a preceding empty line.
+	output := fmt.Sprintf("\n%s=== ADHD Checkpoint ===\n%s%s\n",
+		colorCyan, qResp.Question, colorReset)
+	fmt.Print(output)
+	return qResp.Question, nil
 }
 
 // clientPostInteraction sends an interaction response.
@@ -385,24 +533,8 @@ func clientPostInteraction(serverAddr string, folder, question, answer string) e
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("Server response: %s\n", body)
-	return nil
-}
-
-// clientGetUpdates shows how to get update information.
-func clientGetUpdates(serverAddr string) error {
-	resp, err := http.Get("http://" + serverAddr + "/updates")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var up UpdateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&up); err != nil {
-		return err
-	}
-	fmt.Printf("Recent file changes: %d\nActive minutes today: %d\nNext question in: %s\n",
-		up.RecentFileChanges, up.ActiveMinutes, up.NextQuestionIn)
+	output := fmt.Sprintf("\n%sServer response: %s%s\n", colorCyan, string(body), colorReset)
+	fmt.Print(output)
 	return nil
 }
 
@@ -411,22 +543,17 @@ func clientGetUpdates(serverAddr string) error {
 // ------------------------------
 
 func main() {
-	// Use a command-line flag "mode" to select server or client.
 	mode := flag.String("mode", "server", "Mode: server or client")
 	addr := flag.String("addr", "localhost:8080", "HTTP server address")
+	force := flag.Bool("force", false, "Force question prompt if available")
 	flag.Parse()
 
 	switch *mode {
 	case "server":
-		// Example directories to watch.
-		// (You can adjust these as needed.)
 		home, err := os.UserHomeDir()
 		if err != nil {
 			log.Fatalf("Cannot get home directory: %v", err)
 		}
-		// In the original bash script, project_paths were something like:
-		//   "${HOME}Documents/*" and "${HOME}dotfiles"
-		// Here we watch the Documents directory and dotfiles directory.
 		watchDirs := []string{
 			filepath.Join(home, "Documents"),
 			filepath.Join(home, "dotfiles"),
@@ -435,39 +562,56 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error initializing server: %v", err)
 		}
-		err = server.addWatchers()
-		if err != nil {
+		if err := server.addWatchers(); err != nil {
 			log.Fatalf("Error adding watchers: %v", err)
 		}
 		server.startWatcher()
+		// Start periodic server logging.
+		server.startPeriodicLogging()
+
+		// On receiving an exit signal, close any active session and exit.
+		exitChan := make(chan os.Signal, 1)
+		signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-exitChan
+			log.Println("Shutting down: closing active session (if any) and persisting data.")
+			server.statsMutex.Lock()
+			server.closeActiveSession(time.Now())
+			server.statsMutex.Unlock()
+			os.Exit(0)
+		}()
+
 		server.runHTTP(*addr)
 	case "client":
-		// A very simple command-line client.
-		// For example, the client can get updates, get a question, and post an interaction.
-		fmt.Println("Fetching update status from server...")
-		if err := clientGetUpdates(*addr); err != nil {
-			log.Fatalf("Error fetching updates: %v", err)
-		}
-		fmt.Println("Fetching a mindfulness question from server...")
-		if err := clientGetQuestion(*addr); err != nil {
-			log.Fatalf("Error getting question: %v", err)
-		}
-		// In a real client, you might now prompt the user to enter an answer.
-		// Here we simulate by reading from stdin using bufio.
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Print("Please enter your answer (at least 5 words): ")
-		answer, err := reader.ReadString('\n')
-		if err != nil {
-			log.Fatalf("Error reading answer: %v", err)
-		}
-		answer = strings.TrimSpace(answer)
-		// For demonstration, we use the current working directory and the question we just got.
-		cwd, _ := os.Getwd()
-		// In a real implementation, you should capture the actual question that was returned.
-		// Here we use a placeholder.
-		question := "Placeholder Question (see server log)"
-		if err := clientPostInteraction(*addr, cwd, question, answer); err != nil {
-			log.Fatalf("Error posting interaction: %v", err)
+		if *force {
+			question, err := clientGetQuestion(*addr)
+			if err != nil {
+				_ = clientGetUpdates(*addr)
+				return
+			}
+			reader := bufio.NewReader(os.Stdin)
+			var answer string
+			for {
+				fmt.Print("Please enter your answer (at least 5 words): ")
+				answer, err = reader.ReadString('\n')
+				if err != nil {
+					log.Fatalf("Error reading answer: %v", err)
+				}
+				answer = strings.TrimSpace(answer)
+				if len(strings.Fields(answer)) < MinAnswerWords {
+					fmt.Printf("Your answer is too short. Please provide at least %d words.\n", MinAnswerWords)
+					continue
+				}
+				break
+			}
+			cwd, _ := os.Getwd()
+			if err := clientPostInteraction(*addr, cwd, question, answer); err != nil {
+				log.Fatalf("Error posting interaction: %v", err)
+			}
+		} else {
+			if err := clientGetUpdates(*addr); err != nil {
+				log.Fatalf("Error fetching updates: %v", err)
+			}
 		}
 	default:
 		log.Fatalf("Unknown mode: %s", *mode)

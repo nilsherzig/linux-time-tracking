@@ -3,3 +3,6 @@ run:
 
 run-client:
 	go run . --mode=client --addr=localhost:8080
+
+build:
+	go build -o adhd ./main.go
