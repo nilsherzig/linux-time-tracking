@@ -283,7 +283,7 @@ func (s *Server) startWatcher() {
 
 	// Start a background ticker to check for idle sessions.
 	go func() {
-		ticker := time.NewTicker(IdleThreshold)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for now := range ticker.C {
 			s.statsMutex.Lock()
