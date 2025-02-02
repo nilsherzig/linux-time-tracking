@@ -208,7 +208,12 @@ func (s *Server) closeActiveSession(now time.Time) {
 		return
 	}
 	// Compute the session duration.
-	sessionDuration := max(s.currentSessionEnd.Sub(s.currentSessionStart), IdleThreshold)
+	sessionDuration := time.Duration(0)
+	if s.currentSessionEnd.Sub(s.currentSessionStart) < IdleThreshold {
+		sessionDuration = now.Sub(s.currentSessionStart)
+	} else {
+		sessionDuration = s.currentSessionEnd.Sub(s.currentSessionStart)
+	}
 	s.totalActive += sessionDuration
 	s.persistDailyActiveTime()
 	log.Printf("Closed session: start=%s, end=%s, duration=%s; total active today: %s",
