@@ -30,7 +30,7 @@ import (
 const (
 	QuestionInterval       = 10 * time.Minute
 	MinAnswerWords         = 5
-	IdleThreshold          = 2 * time.Minute  // a session ends if no event arrives in this interval
+	IdleThreshold          = 3 * time.Minute  // a session ends if no event arrives in this interval
 	ClientRateLimitMinutes = 2                // client output only once every 2 minutes
 	PeriodicLogInterval    = 10 * time.Second // server logs status every 2 minutes
 )
@@ -46,12 +46,13 @@ var (
 	}
 )
 
-// API response types
-
+// UpdateResponse now includes live-active minutes and time until idle.
 type UpdateResponse struct {
-	ActiveMinutes  int    `json:"active_minutes"`   // total minutes accumulated today
-	NextQuestionIn string `json:"next_question_in"` // as human-readable
-	Message        string `json:"message,omitempty"`
+	ActiveMinutes     int    `json:"active_minutes"`      // minutes accumulated from closed sessions
+	LiveActiveMinutes int    `json:"live_active_minutes"` // closed sessions + current session (if active)
+	TimeUntilIdle     string `json:"time_until_idle"`     // time remaining until session would close (if active)
+	NextQuestionIn    string `json:"next_question_in"`    // as human-readable
+	Message           string `json:"message,omitempty"`
 }
 
 type QuestionResponse struct {
@@ -76,13 +77,13 @@ type Server struct {
 	logMutex   sync.Mutex
 	statsMutex sync.Mutex
 
-	// total active time accumulated for the day (as a Duration)
+	// total active time accumulated from closed sessions (as a Duration)
 	totalActive time.Duration
 
-	// Active session (if any). When a file event comes in:
-	// - if no session is active, start one.
-	// - if one is active and the gap is <= IdleThreshold, update its end time.
-	// - otherwise, close the old session and start a new one.
+	// current active session (if any). When a file event comes in:
+	// - If no session is active, one is started.
+	// - If one is active and the gap is <= IdleThreshold, its end time is updated.
+	// - Otherwise, the old session is closed and a new session is started.
 	currentSessionStart time.Time
 	currentSessionEnd   time.Time
 
@@ -141,7 +142,7 @@ func NewServer(watchDirs []string) (*Server, error) {
 	return s, nil
 }
 
-// loadDailyActiveTime loads the total active time from disk.
+// loadDailyActiveTime loads the total active time (in minutes) from disk.
 func (s *Server) loadDailyActiveTime() {
 	statsFile := filepath.Join(s.statsDir, s.currentDate+"_time.txt")
 	data, err := os.ReadFile(statsFile)
@@ -207,7 +208,7 @@ func (s *Server) closeActiveSession(now time.Time) {
 		return
 	}
 	// Compute the session duration.
-	sessionDuration := s.currentSessionEnd.Sub(s.currentSessionStart)
+	sessionDuration := max(s.currentSessionEnd.Sub(s.currentSessionStart), IdleThreshold)
 	s.totalActive += sessionDuration
 	s.persistDailyActiveTime()
 	log.Printf("Closed session: start=%s, end=%s, duration=%s; total active today: %s",
@@ -282,7 +283,7 @@ func (s *Server) startWatcher() {
 
 	// Start a background ticker to check for idle sessions.
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(IdleThreshold)
 		defer ticker.Stop()
 		for now := range ticker.C {
 			s.statsMutex.Lock()
@@ -306,16 +307,23 @@ func (s *Server) startPeriodicLogging() {
 		for range ticker.C {
 			s.statsMutex.Lock()
 			activeMins := int(s.totalActive.Minutes())
+			liveActive := activeMins
+			var timeUntilIdle time.Duration
 			sessionActive := !s.currentSessionStart.IsZero()
-			var sessionInfo string
 			if sessionActive {
+				// Include current session duration
 				sessionDuration := time.Since(s.currentSessionStart)
-				sessionInfo = fmt.Sprintf("Active session started at %s (running for %s)", s.currentSessionStart.Format("15:04:05"), sessionDuration)
-			} else {
-				sessionInfo = "No active session"
+				liveActive += int(sessionDuration.Minutes())
+				// Calculate time until idle: IdleThreshold - (now - currentSessionEnd)
+				tUntilIdle := IdleThreshold - time.Since(s.currentSessionEnd)
+				if tUntilIdle < 0 {
+					tUntilIdle = 0
+				}
+				timeUntilIdle = tUntilIdle
 			}
 			s.statsMutex.Unlock()
-			log.Printf("[Periodic] Date: %s | Total active minutes today: %d | %s", s.currentDate, activeMins, sessionInfo)
+			log.Printf("[Periodic] Date: %s | Total active minutes (closed sessions): %d | Live active minutes: %d | Time until idle: %s",
+				s.currentDate, activeMins, liveActive, timeUntilIdle.Truncate(time.Second).String())
 		}
 	}()
 }
@@ -350,11 +358,19 @@ func (s *Server) logInteraction(timestamp time.Time, folder, question, answer st
 // GET /updates returns current stats.
 func (s *Server) updatesHandler(w http.ResponseWriter, r *http.Request) {
 	s.statsMutex.Lock()
-	// Compute active minutes from the accumulated total.
+	// Compute active minutes from closed sessions.
 	activeMins := int(s.totalActive.Minutes())
-	// Also, if a session is active, add the current session's duration.
+	liveActive := activeMins
+	var timeUntilIdle time.Duration
+	// If a session is active, add its duration and compute idle countdown.
 	if !s.currentSessionStart.IsZero() {
-		activeMins += int(time.Since(s.currentSessionStart).Minutes())
+		sessionDuration := time.Since(s.currentSessionStart)
+		liveActive += int(sessionDuration.Minutes())
+		tUntilIdle := IdleThreshold - time.Since(s.currentSessionEnd)
+		if tUntilIdle < 0 {
+			tUntilIdle = 0
+		}
+		timeUntilIdle = tUntilIdle
 	}
 	s.statsMutex.Unlock()
 
@@ -368,8 +384,10 @@ func (s *Server) updatesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := UpdateResponse{
-		ActiveMinutes:  activeMins,
-		NextQuestionIn: remaining.Truncate(time.Second).String(),
+		ActiveMinutes:     activeMins,
+		LiveActiveMinutes: liveActive,
+		TimeUntilIdle:     timeUntilIdle.Truncate(time.Second).String(),
+		NextQuestionIn:    remaining.Truncate(time.Second).String(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -485,8 +503,8 @@ func clientGetUpdates(serverAddr string) error {
 		return err
 	}
 	// Print with an extra newline and color.
-	output := fmt.Sprintf("\n%s🛠️  Active minutes today: %d, next question in: %s%s\n",
-		colorCyan, up.ActiveMinutes, up.NextQuestionIn, colorReset)
+	output := fmt.Sprintf("\n%s🛠️  Active minutes today: %d, Live active minutes: %d, Time until idle: %s, next question in: %s%s\n",
+		colorCyan, up.ActiveMinutes, up.LiveActiveMinutes, up.TimeUntilIdle, up.NextQuestionIn, colorReset)
 	fmt.Print(output)
 	updateClientLogTimestamp()
 	return nil
