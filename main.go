@@ -30,9 +30,9 @@ import (
 const (
 	QuestionInterval       = 10 * time.Minute
 	MinAnswerWords         = 5
-	IdleThreshold          = 3 * time.Minute  // a session ends if no event arrives in this interval
-	ClientRateLimitMinutes = 2                // client output only once every 2 minutes
-	PeriodicLogInterval    = 10 * time.Second // server logs status every 2 minutes
+	IdleThreshold          = 3 * time.Minute // a session ends if no event arrives in this interval
+	ClientRateLimitMinutes = 2               // client output only once every 2 minutes
+	PeriodicLogInterval    = 1 * time.Second // server logs status every 2 minutes
 )
 
 var (
